@@ -1,0 +1,227 @@
+import torch
+import math
+
+
+def _check_nan(vec, msg):
+    if torch.isnan(vec).any():
+        raise ValueError(msg)
+
+
+def _safe_normalize(x, threshold=None):
+    norm = torch.norm(x)
+    if threshold is None:
+        threshold = torch.finfo(norm.dtype).eps
+    normalized_x = x / norm if norm > threshold else torch.zeros_like(x)
+    return normalized_x, norm
+
+
+def arnoldi(vec,  # Matrix vector product
+            V,  # List of existing basis
+            H,  # H matrix
+            j):  # number of basis
+    '''
+    Arnoldi iteration to find the j th l2-orthonormal vector
+    compute the j-1 th column of Hessenberg matrix
+    '''
+    _check_nan(vec, 'Matrix vector product is Nan')
+
+    for i in range(j):
+        H[i, j - 1] = torch.dot(vec, V[i])
+        vec = vec - H[i, j-1] * V[i]
+    new_v, vnorm = _safe_normalize(vec)
+    H[j, j - 1] = vnorm
+    return new_v
+
+
+def cal_rotation(a, b):
+    '''
+    Args:
+        a: element h in position j
+        b: element h in position j+1
+
+    Returns:
+        cosine = a / \sqrt{a^2 + b^2}
+        sine = - b / \sqrt{a^2 + b^2}
+    '''
+    c = torch.sqrt(a * a + b * b)
+    return a / c, - b / c
+
+
+def apply_given_rotation(H, cs, ss, j):
+    '''
+    Apply givens rotation to H column
+    :param H:
+    :param cs:
+    :param ss:
+    :param j:
+    :return:
+    '''
+    # apply previous rotation to the 0->j-1 columns
+    for i in range(j):
+        tmp = cs[i] * H[i, j] - ss[i] * H[i + 1, j]
+        H[i + 1, j] = cs[i] * H[i+1, j] + ss[i] * H[i, j]
+        H[i, j] = tmp
+    cs[j], ss[j] = cal_rotation(H[j, j], H[j + 1, j])
+    H[j, j] = cs[j] * H[j, j] - ss[j] * H[j + 1, j]
+    H[j + 1, j] = 0
+    return H, cs, ss
+
+
+def ASGMRES(Avp,              # Linear operator
+          b,                # RHS of the linear system
+          x0=None,          # initial guess, tuple has the same shape as b
+          max_iter=None,    # maximum number of iterations
+          tol=1e-6,         # relative tolerance
+          atol=1e-6,       # absolute tolerance
+          eta = 0.0,
+          track=False       # If True, keep a history of the relative residual error
+          ):
+    bnorm = torch.norm(b)
+    # print("b-norm", bnorm)
+    _check_nan(b, 'RHS of the system is Nan')
+    if max_iter == 0 or bnorm < 1e-8:
+        return b, b, (0, 0)
+
+    if max_iter is None:
+        max_iter = b.shape[0]
+
+    if x0 is None:
+        x0 = torch.zeros_like(b)
+        r0 = b.detach().clone()
+    else:
+        r0 = b.detach().clone() - Avp(x0)
+    # print("Ab-norm", torch.norm(Avp(b)))
+    # print("r-norm", torch.norm(r0))
+    #print("init_norm", torch.norm(Avp(x0)))
+    new_v, rnorm = _safe_normalize(r0)
+    # initial guess residual
+    beta = torch.zeros(max_iter + 1, device=b.device)
+    beta[0] = rnorm
+
+    err_history = []
+    if track:
+        err_history.append((rnorm / bnorm).item())
+
+    V = []
+    V.append(new_v)
+    H = torch.zeros((max_iter + 1, max_iter + 1), device=b.device)
+    cs = torch.zeros(max_iter, device=b.device)  # cosine values at each step
+    ss = torch.zeros(max_iter, device=b.device)  # sine values at each step
+    max_deter_iter = math.floor(eta)
+    term_min = max_deter_iter + 1
+    init_prob = 1 - (eta - max_deter_iter)
+    prev_sol = x0.detach().clone()
+    sol = x0.detach().clone()
+    sol_b = x0.detach().clone()
+    update_p = torch.zeros_like(b)
+    sum_prob = 0.0
+    weight = 1
+    p_list = []
+    g_prev = 0.0
+    g_curr = 0.0
+
+    for j in range(term_min + 1):
+        p = Avp(V[j])
+        new_v = arnoldi(p, V, H, j + 1)  # Arnoldi iteration to get the j+1 th ba
+        # sis
+        V.append(new_v)
+
+        H, cs, ss = apply_given_rotation(H, cs, ss, j)
+        beta[j + 1] = ss[j] * beta[j]
+        beta[j] = cs[j] * beta[j]
+        residual = torch.abs(beta[j + 1])
+        if track:
+            err_history.append((residual / bnorm).item())
+        # print("j", j)
+        # print("residual", residual)
+        y, _ = torch.triangular_solve(beta[0:j + 1].unsqueeze(-1), H[0:j + 1, 0:j + 1])
+        V_s = torch.stack(V[:-1], dim=0)
+        sol = x0 + V_s.T @ y.squeeze(-1)
+        amp = sol - prev_sol
+        Avp_ = Avp(amp)
+        g_prev = g_curr
+        g_curr = torch.dot(Avp_, Avp_)
+        if term_min == j:
+            if term_min > 0:
+                init_prob = max(0, init_prob * (math.sqrt(g_prev) - math.sqrt(g_curr)) / math.sqrt(g_prev))
+                p_list.append(init_prob)
+            sum_prob += init_prob
+            dice = torch.rand(1, device = b.device)
+            #print("dice", dice)
+            if dice < init_prob:
+                return prev_sol, prev_sol, (j+1, err_history)
+        # if residual < tol * bnorm or residual < atol:
+        #     return prev_sol, prev_sol, (j, err_history)
+        if torch.isnan(residual):
+            return prev_sol, prev_sol, (j+1, err_history)
+        weight = 1 / (1 - sum_prob)
+        if j == term_min:
+            sol_b = prev_sol
+            sol_b.add_(weight * amp)
+        prev_sol = sol
+    
+    value_d = math.sqrt(g_prev) 
+    count = 1 
+
+    for j in range(term_min + 1, max_iter):
+        if g_prev < g_curr:
+            p = Avp(V[j])
+            new_v = arnoldi(p, V, H, j + 1)  # Arnoldi iteration to get the j+1 th ba
+            # sis
+            V.append(new_v)
+            H, cs, ss = apply_given_rotation(H, cs, ss, j)
+            beta[j + 1] = ss[j] * beta[j]
+            beta[j] = cs[j] * beta[j]
+            residual = torch.abs(beta[j + 1])
+            if track:
+                err_history.append((residual / bnorm).item())
+            # print("j", j)
+            # print("residual", residual)
+            y, _ = torch.triangular_solve(beta[0:j + 1].unsqueeze(-1), H[0:j + 1, 0:j + 1])
+            V_s = torch.stack(V[:-1], dim=0)
+            sol = x0 + V_s.T @ y.squeeze(-1)
+            amp = sol - prev_sol
+            #print(j)
+            # if residual < tol * bnorm or residual < atol:
+            if torch.isnan(residual):
+                return sol_b, prev_sol, (j+1, err_history)
+            weight = 1 / (1 - sum_prob)
+            sol_b.add_(weight * amp)
+            Avp_ = Avp(amp)
+            g_curr = (g_curr * count + torch.dot(Avp_, Avp_)) / (count + 1)
+            count += 1
+            prev_sol = sol
+        else:
+            value_n = math.sqrt(g_prev) - math.sqrt(g_curr)
+            curr_prob = value_n / value_d * (1 - init_prob)
+            dice = torch.rand(1, device = b.device)
+            #print("dice", dice)
+            if dice < (curr_prob / (1 - sum_prob)):
+                return sol_b, sol, (j, err_history)
+            sum_prob += curr_prob
+            p = Avp(V[j])
+            new_v = arnoldi(p, V, H, j + 1)  # Arnoldi iteration to get the j+1 th ba
+            # sis
+            V.append(new_v)
+            H, cs, ss = apply_given_rotation(H, cs, ss, j)
+            beta[j + 1] = ss[j] * beta[j]
+            beta[j] = cs[j] * beta[j]
+            residual = torch.abs(beta[j + 1])
+            if track:
+                err_history.append((residual / bnorm).item())
+            # print("j", j)
+            # print("residual", residual)
+            y, _ = torch.triangular_solve(beta[0:j + 1].unsqueeze(-1), H[0:j + 1, 0:j + 1])
+            V_s = torch.stack(V[:-1], dim=0)
+            sol = x0 + V_s.T @ y.squeeze(-1)
+            amp = sol - prev_sol
+            if torch.isnan(residual):
+                return sol_b, prev_sol, (j+1, err_history)
+            weight = 1 / (1 - sum_prob)
+            sol_b.add_(weight * amp)
+            g_prev = g_curr
+            Avp_ = Avp(amp)
+            g_curr = torch.dot(Avp_, Avp_)
+            count = 1
+            prev_sol = sol
+    return sol_b, sol, (j, err_history)
